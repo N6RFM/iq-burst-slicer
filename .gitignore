@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.iq
+*.sigmf-data
+*.sigmf-meta
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.DS_Store
