@@ -43,6 +43,9 @@ pip install -r requirements.txt
 
 ## Usage
 
+Want to try the tools immediately without your own data? The repo ships a
+small example file — see [`examples/`](examples/).
+
 ```bash
 # Slice bursts out of a large recording
 python3 burst_slicer.py my_capture.iq --fs 50000 \

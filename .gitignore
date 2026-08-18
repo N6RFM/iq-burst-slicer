@@ -3,6 +3,7 @@ __pycache__/
 *.iq
 *.sigmf-data
 *.sigmf-meta
+!examples/example_signal.iq
 .pytest_cache/
 *.egg-info/
 build/
