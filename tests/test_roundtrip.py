@@ -1,5 +1,5 @@
 """
-Round-trip tests for burst_slicer.py + sigmf_to_iq.py.
+Round-trip tests for burst_slicer.py + sigmf_to_iq.py + digitalrf_to_iq.py.
 
 Uses a synthetic signal deliberately unlike any specific real-world protocol
 this tool was developed against (different sample rate, different
@@ -7,6 +7,10 @@ modulation, much shorter bursts, irregular spacing including two bursts
 close enough together to exercise the merge-vs-split logic) to verify the
 tools are genuinely general-purpose burst detectors/reconstructors, not
 tuned to one signal.
+
+Digital RF tests are skipped automatically if the `digital_rf` package
+isn't installed (it's an optional dependency -- only needed for
+--format digitalrf).
 """
 
 import json
@@ -20,6 +24,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SLICER = REPO_ROOT / 'burst_slicer.py'
 RESTORER = REPO_ROOT / 'sigmf_to_iq.py'
+DRF_RESTORER = REPO_ROOT / 'digitalrf_to_iq.py'
+
+try:
+    import digital_rf  # noqa: F401
+    HAVE_DIGITAL_RF = True
+except ImportError:
+    HAVE_DIGITAL_RF = False
+
+requires_digital_rf = pytest.mark.skipif(
+    not HAVE_DIGITAL_RF, reason='digital_rf package not installed (optional dependency)')
 
 
 @pytest.fixture
@@ -131,3 +145,65 @@ def test_compact_reconstruction_contains_only_burst_samples(synthetic_signal, tm
                                dtype=np.float32).view(np.complex64)
     compact_data = np.fromfile(compact_path, dtype=np.float32).view(np.complex64)
     np.testing.assert_array_equal(sliced_data, compact_data)
+
+
+@requires_digital_rf
+def test_digitalrf_slice_detects_expected_burst_count(synthetic_signal, tmp_path):
+    path, fs, _ = synthetic_signal
+    out_dir = tmp_path / 'sliced_drf'
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', '2026-08-18T12:00:00', '-o', str(out_dir),
+        '--format', 'digitalrf',
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+
+    info = json.loads((out_dir / 'burstslicer_info.json').read_text())
+    assert len(info['captures']) == 4  # same expected merge behavior as the SigMF test
+    assert info['sample_rate'] == fs
+
+
+@requires_digital_rf
+def test_digitalrf_full_timeline_reconstruction_is_byte_identical(synthetic_signal, tmp_path):
+    path, fs, original_sig = synthetic_signal
+    out_dir = tmp_path / 'sliced_drf'
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', '2026-08-18T12:00:00', '-o', str(out_dir),
+        '--format', 'digitalrf',
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+
+    restored_path = tmp_path / 'restored_drf.iq'
+    run(str(DRF_RESTORER), str(out_dir), '-o', str(restored_path), '--full-timeline')
+
+    restored = np.fromfile(restored_path, dtype=np.float32).view(np.complex64)
+    assert len(restored) == len(original_sig)
+
+    info = json.loads((out_dir / 'burstslicer_info.json').read_text())
+    for cap in info['captures']:
+        s0 = cap['sample_start']
+        n = cap['sample_count']
+        np.testing.assert_array_equal(
+            restored[s0:s0 + n], original_sig[s0:s0 + n])
+
+
+@requires_digital_rf
+def test_digitalrf_and_sigmf_produce_comparable_size(synthetic_signal, tmp_path):
+    """Regression guard for the corrected comparison: with compression
+    enabled, Digital RF should NOT be dramatically larger than SigMF for
+    this kind of sparse-burst signal (they were found to be within ~1% of
+    each other in real testing -- see README). This test just guards
+    against a large regression, not an exact ratio."""
+    path, fs, _ = synthetic_signal
+
+    sigmf_base = tmp_path / 'sliced_sigmf'
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', '2026-08-18T12:00:00', '-o', str(sigmf_base),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+    sigmf_size = sigmf_base.with_suffix('.sigmf-data').stat().st_size
+
+    drf_dir = tmp_path / 'sliced_drf'
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', '2026-08-18T12:00:00', '-o', str(drf_dir),
+        '--format', 'digitalrf', '--drf-compression-level', '9',
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+    drf_size = sum(f.stat().st_size for f in drf_dir.rglob('*') if f.is_file())
+
+    assert drf_size < sigmf_size * 1.5  # generous margin; real ratio was ~1.0

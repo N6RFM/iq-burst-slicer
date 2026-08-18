@@ -16,4 +16,5 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements-dev.txt
+      - run: pip install -r requirements-digitalrf.txt || echo "digital_rf install failed, those tests will skip"
       - run: pytest tests/ -v

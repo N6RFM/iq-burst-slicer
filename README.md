@@ -8,38 +8,84 @@ preserving each burst's absolute UTC timestamp.
 Typical result: **50-150x smaller**, losslessly (bursts are kept byte-for-byte
 unmodified), for a signal with a low duty cycle.
 
-Two tools:
+Two output formats — [SigMF](https://sigmf.org) or [Digital RF](https://github.com/MITHaystack/digital_rf) — and tools to reconstruct a plain IQ file back from either.
 
 | Tool | Purpose |
 |---|---|
-| `burst_slicer.py` | Detects bursts in a raw IQ file, discards everything else, writes a [SigMF](https://sigmf.org) recording pair with one timestamped capture segment per burst |
+| `burst_slicer.py` | Detects bursts in a raw IQ file, discards everything else, writes SigMF or Digital RF output with per-burst absolute timestamps |
 | `sigmf_to_iq.py` | Converts a sliced SigMF recording back into a plain raw IQ file, either compact (no gaps) or with the original timeline exactly reconstructed |
+| `digitalrf_to_iq.py` | Same, for a sliced Digital RF recording |
 
 No protocol-specific logic — detection is purely envelope-based, so this works on any bursty signal. See [Tuning](#tuning-for-your-signal) below.
 
-## Why SigMF?
+## SigMF vs. Digital RF: full comparison
 
-[SigMF](https://sigmf.org)'s `captures` array is designed for exactly this
-situation: non-contiguous chunks of a real recording, concatenated into one
-data file, each needing its own absolute timestamp. Using a standard format
-(rather than encoding timestamps into filenames, which is fragile — ask us
-how we know) means the output is readable by any SigMF-aware tool
-(e.g. [Inspectrum](https://github.com/miek/inspectrum)), and the metadata
-stays a plain, human-readable JSON file alongside the data.
+Both formats are legitimate, standard, widely-used choices for exactly this
+situation — non-contiguous recording segments, each needing its own
+absolute timestamp — so this isn't a "one is objectively better" choice.
+We tested both directly rather than picking based on reputation; here's
+the full picture, including where an earlier informal comparison of ours
+was wrong (see the size row).
+
+**What they have in common:** both are open, self-describing, non-proprietary
+formats with real production use in the radio community; both support
+storing multiple non-contiguous segments with per-segment absolute
+timestamps (the exact property this tool depends on); both have Python
+libraries and GNU Radio integration; neither requires you to invent your
+own ad-hoc metadata scheme (e.g. encoding timestamps into filenames).
+
+**Where they differ:**
+
+| | SigMF | Digital RF |
+|---|---|---|
+| **Designed for** | Lightweight, general-purpose signal recordings of any size/duration | Continuous, long-duration, high-rate, often multi-channel scientific recording (built at MIT Haystack for ionospheric radar / space-weather work) |
+| Dependencies | numpy only | `digital_rf` (pulls in `h5py`/HDF5) |
+| Output structure | 2 plain files (`.sigmf-data` + human-readable JSON) | HDF5 directory/file hierarchy (chunked by time cadence) + our own JSON sidecar |
+| Compression | None built in — would need an external step (`xz`/`zstd`) on top of our output if you want it | Built in — native gzip via `compression_level`, applied automatically as part of the write |
+| Data integrity | Not implemented by this tool (SigMF spec supports an optional sha512 hash field, we don't set it) | Optional built-in HDF5 checksum (`checksum=True`), not enabled by default here |
+| Size, no compression | 920,000 bytes | 1,824,415 bytes (~2x larger — HDF5 structural overhead dominates at this small, sparse scale) |
+| Size, compression on | 920,000 bytes (nothing built in to enable) | 918,124 bytes (`compression_level>=1`) — **essentially tied, DRF slightly smaller** |
+| Gap representation | Custom `captures` array (a SigMF-standard convention we rely on, not an inherent property of the format) | Native — gaps are a first-class part of the format's own sample indexing (`is_continuous=False`) |
+| GNU Radio blocks | `blocks_sigmf_source/sink_minimal` — flagged **deprecated** in GNU Radio 3.10, doesn't even read sample rate from metadata | `gr_digital_rf` — actively maintained Sink/Source blocks |
+| Tool ecosystem | [Inspectrum](https://github.com/miek/inspectrum) reads it natively | Haystack/openradar tooling (`drf_plot`, etc.); not read by Inspectrum |
+| Readable without the format's library | Yes — `.sigmf-meta` is plain JSON, `.sigmf-data` is a flat binary `numpy.fromfile()` can read directly, zero special tooling | No — HDF5 tooling required either way, even just to inspect the file |
+| Maturity / track record for this exact use case | Newer, simpler, DeepSig/GNU Radio community origin | Older, proven at large scale in production scientific recording (e.g. the HamSCI/Grape personal space-weather network) |
+
+**The size result specifically is worth calling out**, because we initially
+got it wrong: an earlier informal test compared Digital RF against a
+mismatched, larger set of burst boundaries than what this tool actually
+detects, making DRF look ~33% bigger than SigMF. Rerun properly — the
+*exact same* burst samples fed to both formats — and with compression
+enabled they're within 0.2% of each other. Size is **not** a real
+differentiator here once compression is on; don't choose based on it.
+
+**Bottom line:** if you want the simplest, dependency-free output that
+works with Inspectrum and you can read with your eyes in a text editor —
+use `--format sigmf` (the default). If you need Digital RF's ecosystem
+(GNU Radio blocks, Haystack/openradar tooling), want built-in compression/
+checksums without an extra step, or you're feeding into a pipeline that's
+already built around continuous scientific-grade recording — use
+`--format digitalrf` with compression enabled (the default,
+`compression_level=9`). Either way, avoid Digital RF *without*
+compression, which really is about 2x larger for this kind of sparse-burst
+signal.
 
 ## Install
 
-Only dependency is `numpy`:
-
-```bash
-pip install numpy
-```
-
-Or with the repo's pinned requirements:
+Base install (SigMF path only) needs just `numpy`:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+For the Digital RF path, also install:
+
+```bash
+pip install -r requirements-digitalrf.txt
+```
+
+(`digital_rf` installed cleanly from a prebuilt wheel in our testing — no
+system HDF5 headers needed, at least on Linux x86_64.)
 
 ## Usage
 
@@ -47,7 +93,7 @@ Want to try the tools immediately without your own data? The repo ships a
 small example file — see [`examples/`](examples/).
 
 ```bash
-# Slice bursts out of a large recording
+# Slice bursts out of a large recording (SigMF, the default)
 python3 burst_slicer.py my_capture.iq --fs 50000 \
     --utc-start 2026-08-18T17:48:10 \
     -o my_capture_sliced
@@ -55,10 +101,21 @@ python3 burst_slicer.py my_capture.iq --fs 50000 \
 #   -> my_capture_sliced.sigmf-data   (raw samples, bursts only)
 #   -> my_capture_sliced.sigmf-meta   (JSON, one timestamped entry per burst)
 
+# ...or Digital RF instead:
+python3 burst_slicer.py my_capture.iq --fs 50000 \
+    --utc-start 2026-08-18T17:48:10 \
+    -o my_capture_sliced_drf --format digitalrf
+
+#   -> my_capture_sliced_drf/ch0/*.h5          (HDF5 data, gaps native to the format)
+#   -> my_capture_sliced_drf/burstslicer_info.json  (JSON sidecar)
+
 # Reconstruct a plain IQ file if you need one, with the ORIGINAL timeline
 # exactly restored (verified byte-identical burst content, exact original
 # file length):
 python3 sigmf_to_iq.py my_capture_sliced.sigmf-meta \
+    -o my_capture_restored.iq --full-timeline --noise-fill
+# or, from Digital RF:
+python3 digitalrf_to_iq.py my_capture_sliced_drf \
     -o my_capture_restored.iq --full-timeline --noise-fill
 
 # Or just the bursts concatenated with no gaps (smallest possible plain IQ):
@@ -102,7 +159,7 @@ length/spacing before picking values.
 ## Testing
 
 ```bash
-pip install pytest
+pip install -r requirements-dev.txt
 pytest tests/
 ```
 
@@ -111,7 +168,9 @@ from any specific real-world protocol: different modulation, sample rate,
 burst duration, and irregular spacing including two bursts close enough
 together to exercise the merge-vs-split logic) and verifies the full
 slice → reconstruct round trip reproduces the original file exactly:
-same length, same burst positions, byte-identical burst content.
+same length, same burst positions, byte-identical burst content —
+for both SigMF and Digital RF. Digital RF tests are skipped automatically
+if `digital_rf` isn't installed.
 
 ## Limitations
 

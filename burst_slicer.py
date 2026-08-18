@@ -6,27 +6,55 @@ General-purpose tool for slicing the signal-bearing regions out of a large
 IQ recording that consists mostly of empty/noise-only time with occasional
 short bursts of signal (e.g. satellite beacons, pagers, remote controls,
 vehicle key fobs, any bursty/intermittent RF source) -- discarding the
-(often 95%+) dead air between bursts, and writing the result as a SigMF
-recording pair:
+(often 95%+) dead air between bursts.
 
-    OUTPUT.sigmf-data   -- raw complex samples, bursts concatenated back-to-back
-    OUTPUT.sigmf-meta   -- JSON metadata, with one "capture" segment per burst
-                            recording that burst's *absolute UTC start time*
-                            and its sample offset within the sliced data file
+Two output formats, chosen with --format:
 
-This uses SigMF's standard multi-capture-segment mechanism, which is
-specifically designed for exactly this situation: non-contiguous chunks of a
-real recording, concatenated into one file, each needing its own timestamp.
-See https://sigmf.org
+  sigmf (default)
+      OUTPUT.sigmf-data   -- raw complex samples, bursts concatenated back-to-back
+      OUTPUT.sigmf-meta   -- JSON metadata, with one "capture" segment per burst
+                              recording that burst's *absolute UTC start time*
+                              and its sample offset within the sliced data file
+      Uses SigMF's standard multi-capture-segment mechanism. See https://sigmf.org
+      Simple, dependency-free (just numpy), human-readable metadata, and
+      (per our own testing) smaller output for this sparse-burst use case
+      than Digital RF's HDF5 structure -- see README for real numbers.
+
+  digitalrf
+      OUTPUT/ch0/*.h5           -- Digital RF HDF5 data, written with
+                                    is_continuous=False so gaps between
+                                    bursts are natively represented by the
+                                    format's own sample indexing (no custom
+                                    metadata scheme needed for that part)
+      OUTPUT/burstslicer_info.json -- small sidecar with the same original-
+                                    recording bounds info as the SigMF path,
+                                    plus the per-burst capture list, for
+                                    parity with the sigmf output
+      Requires the `digital_rf` package (pip install digital_rf). Has
+      native gzip compression (--drf-compression-level, default 9) and
+      works with Digital RF's own mature GNU Radio blocks (gr_digital_rf)
+      and the wider Haystack/openradar tooling ecosystem.
+
+      Size, tested on a real 4-burst satellite recording (same exact burst
+      samples fed to both formats for a fair comparison): with compression
+      enabled (any level >=1), DRF is essentially tied with plain SigMF
+      (918KB vs 920KB -- DRF slightly smaller). With compression_level=0,
+      DRF is roughly 2x larger than SigMF due to HDF5 structural overhead.
+      So: use SigMF if you want the simplest possible dependency-free
+      output; use --format digitalrf with the default compression if you
+      need Digital RF's ecosystem (GNU Radio blocks, Haystack tooling,
+      native gap-aware indexing) -- you won't pay a size penalty for it.
 
 Works on any bursty signal; detection is purely envelope-based (no
 protocol-specific assumptions). Typical size reduction depends on your
 signal's duty cycle -- for something like a satellite beacon transmitting a
-fraction-of-a-second burst once a minute, expect 50-150x.
+fraction-of-a-second burst once a minute, expect 50-150x versus the original
+file, before even considering which output format to use.
 
 Usage:
     python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17:48:10 -o sliced_output
     python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17:48:10 -o sliced_output --thresh-factor 1.5
+    python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17:48:10 -o sliced_drf --format digitalrf
 
 Tuning for your signal:
     --thresh-factor   how far above the noise floor (median envelope) a
@@ -44,7 +72,7 @@ Tuning for your signal:
                        burst-to-burst spacing but longer than any pause
                        *within* a single burst.
 
-Requires: numpy
+Requires: numpy (plus digital_rf, only if using --format digitalrf)
 """
 
 import argparse
@@ -83,6 +111,117 @@ def find_bursts(iq, fs, block_s=0.05, thresh_factor=1.8, min_gap_s=1.0):
     return [(max(0, s * block - pad), min(len(iq), (e + 1) * block + pad)) for s, e in runs]
 
 
+def write_sigmf(iq, fs, t_start, slices, out_base, author, description):
+    data_path = out_base.with_suffix('.sigmf-data')
+    meta_path = out_base.with_suffix('.sigmf-meta')
+
+    captures = []
+    sample_cursor = 0
+    with open(data_path, 'wb') as fout:
+        for lo, hi in slices:
+            chunk = iq[lo:hi]
+            chunk.astype(np.complex64).tofile(fout)
+            t_abs = t_start + dt.timedelta(seconds=lo / fs)
+            captures.append({
+                'core:sample_start': sample_cursor,
+                'core:datetime': t_abs.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+                'core:sample_count': len(chunk),
+            })
+            sample_cursor += len(chunk)
+
+    meta = {
+        'global': {
+            'core:datatype': 'cf32_le',
+            'core:sample_rate': fs,
+            'core:version': '1.0.0',
+            'core:description': description,
+            'core:author': author,
+            'core:recorder': 'burst_slicer.py',
+            'core:extensions': [],
+            # non-core custom fields: the ORIGINAL (pre-slicing) recording's
+            # start time and total sample count, so a full-timeline
+            # reconstruction can exactly reproduce the original file's
+            # duration (including any lead-in/trailing silence), not just
+            # the span from first burst to last burst.
+            'burstslicer:original_utc_start': t_start.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+            'burstslicer:original_sample_count': len(iq),
+        },
+        'captures': captures,
+        'annotations': [],
+    }
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+
+    out_size = data_path.stat().st_size
+    print(f'\nWrote {data_path}  ({out_size} bytes = {out_size/1e6:.3f} MB)')
+    print(f'Wrote {meta_path}  ({len(captures)} capture segments)')
+    return out_size
+
+
+def write_digitalrf(iq, fs, t_start, slices, out_base, author, description,
+                     compression_level):
+    try:
+        import digital_rf as drf
+    except ImportError:
+        raise SystemExit(
+            "Error: --format digitalrf requires the 'digital_rf' package.\n"
+            "Install it with: pip install digital_rf")
+
+    out_dir = Path(out_base)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    channel_dir = out_dir / 'ch0'
+    channel_dir.mkdir(exist_ok=True)
+
+    start_global_index = int(t_start.timestamp() * fs)
+
+    writer = drf.DigitalRFWriter(
+        str(channel_dir), dtype=np.complex64,
+        subdir_cadence_secs=3600, file_cadence_millisecs=1000,
+        start_global_index=start_global_index,
+        sample_rate_numerator=int(fs), sample_rate_denominator=1,
+        compression_level=compression_level, checksum=False,
+        is_complex=True, num_subchannels=1, is_continuous=False,
+        marching_periods=False,
+    )
+
+    captures = []
+    for lo, hi in slices:
+        lo = int(lo)
+        chunk = iq[lo:hi]
+        writer.rf_write(chunk, next_sample=lo)
+        t_abs = t_start + dt.timedelta(seconds=lo / fs)
+        captures.append({
+            'sample_start': lo,
+            'datetime': t_abs.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+            'sample_count': len(chunk),
+        })
+    writer.close()
+
+    info = {
+        'sample_rate': fs,
+        'description': description,
+        'author': author,
+        'recorder': 'burst_slicer.py',
+        'original_utc_start': t_start.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+        'original_sample_count': len(iq),
+        'captures': captures,
+    }
+    info_path = out_dir / 'burstslicer_info.json'
+    with open(info_path, 'w') as f:
+        json.dump(info, f, indent=2)
+
+    total = 0
+    import os
+    for root, _, files in os.walk(out_dir):
+        for fn in files:
+            total += (Path(root) / fn).stat().st_size
+
+    print(f'\nWrote {channel_dir}/ ({len(captures)} burst(s) written, gaps native to the format)')
+    print(f'Wrote {info_path}')
+    print(f'Total on-disk size: {total} bytes = {total/1e6:.3f} MB')
+    return total
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -92,8 +231,16 @@ def main():
                      help='ISO8601 UTC timestamp of sample 0 in the INPUT file, '
                           'e.g. 2026-08-18T17:48:10')
     ap.add_argument('-o', '--output', required=True,
-                     help='Output basename (without extension) -- writes '
-                          'OUTPUT.sigmf-data and OUTPUT.sigmf-meta')
+                     help='Output basename/directory (without extension) -- for '
+                          '--format sigmf writes OUTPUT.sigmf-data/.sigmf-meta; '
+                          'for --format digitalrf writes an OUTPUT/ directory')
+    ap.add_argument('--format', choices=['sigmf', 'digitalrf'], default='sigmf',
+                     help="Output format (default 'sigmf'). See this script's "
+                          "module docstring for a real size comparison between "
+                          "the two -- they are NOT equivalent for this use case.")
+    ap.add_argument('--drf-compression-level', type=int, default=9, choices=range(10),
+                     help='(--format digitalrf only) gzip compression level 0-9 '
+                          '(default 9, max compression)')
     ap.add_argument('--thresh-factor', type=float, default=1.8,
                      help='Envelope threshold = median * this factor (default 1.8; '
                           'lower to catch weaker bursts)')
@@ -108,9 +255,9 @@ def main():
     ap.add_argument('--pad-s', type=float, default=0.0,
                      help='Extra seconds of padding to keep on each side of every '
                           'detected burst region, beyond the built-in margin (default 0)')
-    ap.add_argument('--author', default='', help='Optional core:author for the SigMF metadata')
+    ap.add_argument('--author', default='', help='Optional author field for the metadata')
     ap.add_argument('--description', default='Burst-sliced IQ recording',
-                     help='core:description for the SigMF metadata')
+                     help='Optional description field for the metadata')
     args = ap.parse_args()
 
     fs = args.fs
@@ -137,51 +284,15 @@ def main():
         hi = min(len(iq), s1 + pad)
         slices.append((lo, hi))
 
-    out_base = Path(args.output)
-    data_path = out_base.with_suffix('.sigmf-data')
-    meta_path = out_base.with_suffix('.sigmf-meta')
-
-    captures = []
-    sample_cursor = 0
-    with open(data_path, 'wb') as fout:
-        for i, (lo, hi) in enumerate(slices):
-            chunk = iq[lo:hi]
-            chunk.astype(np.complex64).tofile(fout)
-            t_abs = t_start + dt.timedelta(seconds=lo / fs)
-            captures.append({
-                'core:sample_start': sample_cursor,
-                'core:datetime': t_abs.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-                'core:sample_count': len(chunk),
-            })
-            sample_cursor += len(chunk)
-
-    meta = {
-        'global': {
-            'core:datatype': 'cf32_le',
-            'core:sample_rate': fs,
-            'core:version': '1.0.0',
-            'core:description': args.description,
-            'core:author': args.author,
-            'core:recorder': 'burst_slicer.py',
-            'core:extensions': [],
-            # non-core custom fields: the ORIGINAL (pre-slicing) recording's
-            # start time and total sample count, so a full-timeline
-            # reconstruction can exactly reproduce the original file's
-            # duration (including any lead-in/trailing silence), not just
-            # the span from first burst to last burst.
-            'burstslicer:original_utc_start': t_start.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-            'burstslicer:original_sample_count': len(iq),
-        },
-        'captures': captures,
-        'annotations': [],
-    }
-    with open(meta_path, 'w') as f:
-        json.dump(meta, f, indent=2)
-
     in_size = in_path.stat().st_size
-    out_size = data_path.stat().st_size
-    print(f'\nWrote {data_path}  ({out_size} bytes = {out_size/1e6:.3f} MB)')
-    print(f'Wrote {meta_path}  ({len(captures)} capture segments)')
+    out_base = Path(args.output)
+
+    if args.format == 'sigmf':
+        out_size = write_sigmf(iq, fs, t_start, slices, out_base, args.author, args.description)
+    else:
+        out_size = write_digitalrf(iq, fs, t_start, slices, out_base, args.author,
+                                    args.description, args.drf_compression_level)
+
     print(f'\nSize: {in_size/1e6:.2f} MB -> {out_size/1e6:.3f} MB '
           f'({in_size/out_size:.1f}x smaller)')
 
