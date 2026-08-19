@@ -13,6 +13,7 @@ isn't installed (it's an optional dependency -- only needed for
 --format digitalrf).
 """
 
+import datetime as dt
 import json
 import subprocess
 import sys
@@ -34,6 +35,20 @@ except ImportError:
 
 requires_digital_rf = pytest.mark.skipif(
     not HAVE_DIGITAL_RF, reason='digital_rf package not installed (optional dependency)')
+
+
+def expected_out_base(out_arg, utc_start_str):
+    """burst_slicer.py appends '_{utc_start, normalized to hyphens}_utc' to
+    whatever -o basename was given -- reproduce that here so tests know
+    where to actually look for output files."""
+    ts = utc_start_str
+    if 'T' in ts:
+        date_part, time_part = ts.split('T', 1)
+        time_part = time_part.replace('-', ':')
+        ts = f'{date_part}T{time_part}'
+    t = dt.datetime.fromisoformat(ts)
+    suffix = t.strftime('%Y-%m-%dT%H-%M-%S')
+    return Path(f'{out_arg}_{suffix}_utc')
 
 
 @pytest.fixture
@@ -70,14 +85,18 @@ def run(*args):
     return result.stdout
 
 
+UTC_START = '2026-08-18T12:00:00'
+
+
 def test_slice_detects_expected_burst_count(synthetic_signal, tmp_path):
     path, fs, _ = synthetic_signal
-    out_base = tmp_path / 'sliced'
+    out_arg = tmp_path / 'sliced'
     run(str(SLICER), str(path), '--fs', str(fs),
-        '--utc-start', '2026-08-18T12:00:00',
-        '-o', str(out_base),
+        '--utc-start', UTC_START,
+        '-o', str(out_arg),
         '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
 
+    out_base = expected_out_base(out_arg, UTC_START)
     meta = json.loads((out_base.with_suffix('.sigmf-meta')).read_text())
     # 5 burst pulses generated, but two (8.9s, 8.95s) are only 0.05s apart,
     # well under min_gap_s=0.5, so they should merge into one region -> 4 total
@@ -87,11 +106,12 @@ def test_slice_detects_expected_burst_count(synthetic_signal, tmp_path):
 
 def test_slice_produces_smaller_file(synthetic_signal, tmp_path):
     path, fs, _ = synthetic_signal
-    out_base = tmp_path / 'sliced'
+    out_arg = tmp_path / 'sliced'
     run(str(SLICER), str(path), '--fs', str(fs),
-        '--utc-start', '2026-08-18T12:00:00', '-o', str(out_base),
+        '--utc-start', UTC_START, '-o', str(out_arg),
         '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
 
+    out_base = expected_out_base(out_arg, UTC_START)
     original_size = path.stat().st_size
     sliced_size = out_base.with_suffix('.sigmf-data').stat().st_size
     assert sliced_size < original_size / 10  # expect at least 10x reduction for this test signal
@@ -99,10 +119,11 @@ def test_slice_produces_smaller_file(synthetic_signal, tmp_path):
 
 def test_full_timeline_reconstruction_is_byte_identical(synthetic_signal, tmp_path):
     path, fs, original_sig = synthetic_signal
-    out_base = tmp_path / 'sliced'
+    out_arg = tmp_path / 'sliced'
     run(str(SLICER), str(path), '--fs', str(fs),
-        '--utc-start', '2026-08-18T12:00:00', '-o', str(out_base),
+        '--utc-start', UTC_START, '-o', str(out_arg),
         '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+    out_base = expected_out_base(out_arg, UTC_START)
 
     restored_path = tmp_path / 'restored.iq'
     run(str(RESTORER), str(out_base.with_suffix('.sigmf-meta')),
@@ -116,7 +137,6 @@ def test_full_timeline_reconstruction_is_byte_identical(synthetic_signal, tmp_pa
     # every burst region must be byte-identical to the original
     meta = json.loads((out_base.with_suffix('.sigmf-meta')).read_text())
     t0 = None
-    import datetime as dt
     for cap in meta['captures']:
         t_abs = dt.datetime.fromisoformat(cap['core:datetime'].replace('Z', '+00:00'))
         if t0 is None:
@@ -132,10 +152,11 @@ def test_full_timeline_reconstruction_is_byte_identical(synthetic_signal, tmp_pa
 
 def test_compact_reconstruction_contains_only_burst_samples(synthetic_signal, tmp_path):
     path, fs, _ = synthetic_signal
-    out_base = tmp_path / 'sliced'
+    out_arg = tmp_path / 'sliced'
     run(str(SLICER), str(path), '--fs', str(fs),
-        '--utc-start', '2026-08-18T12:00:00', '-o', str(out_base),
+        '--utc-start', UTC_START, '-o', str(out_arg),
         '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+    out_base = expected_out_base(out_arg, UTC_START)
 
     compact_path = tmp_path / 'compact.iq'
     run(str(RESTORER), str(out_base.with_suffix('.sigmf-meta')),
@@ -150,12 +171,13 @@ def test_compact_reconstruction_contains_only_burst_samples(synthetic_signal, tm
 @requires_digital_rf
 def test_digitalrf_slice_detects_expected_burst_count(synthetic_signal, tmp_path):
     path, fs, _ = synthetic_signal
-    out_dir = tmp_path / 'sliced_drf'
+    out_arg = tmp_path / 'sliced_drf'
     run(str(SLICER), str(path), '--fs', str(fs),
-        '--utc-start', '2026-08-18T12:00:00', '-o', str(out_dir),
+        '--utc-start', UTC_START, '-o', str(out_arg),
         '--format', 'digitalrf',
         '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
 
+    out_dir = expected_out_base(out_arg, UTC_START)
     info = json.loads((out_dir / 'burstslicer_info.json').read_text())
     assert len(info['captures']) == 4  # same expected merge behavior as the SigMF test
     assert info['sample_rate'] == fs
@@ -164,11 +186,12 @@ def test_digitalrf_slice_detects_expected_burst_count(synthetic_signal, tmp_path
 @requires_digital_rf
 def test_digitalrf_full_timeline_reconstruction_is_byte_identical(synthetic_signal, tmp_path):
     path, fs, original_sig = synthetic_signal
-    out_dir = tmp_path / 'sliced_drf'
+    out_arg = tmp_path / 'sliced_drf'
     run(str(SLICER), str(path), '--fs', str(fs),
-        '--utc-start', '2026-08-18T12:00:00', '-o', str(out_dir),
+        '--utc-start', UTC_START, '-o', str(out_arg),
         '--format', 'digitalrf',
         '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+    out_dir = expected_out_base(out_arg, UTC_START)
 
     restored_path = tmp_path / 'restored_drf.iq'
     run(str(DRF_RESTORER), str(out_dir), '-o', str(restored_path), '--full-timeline')
@@ -193,17 +216,111 @@ def test_digitalrf_and_sigmf_produce_comparable_size(synthetic_signal, tmp_path)
     against a large regression, not an exact ratio."""
     path, fs, _ = synthetic_signal
 
-    sigmf_base = tmp_path / 'sliced_sigmf'
+    sigmf_arg = tmp_path / 'sliced_sigmf'
     run(str(SLICER), str(path), '--fs', str(fs),
-        '--utc-start', '2026-08-18T12:00:00', '-o', str(sigmf_base),
+        '--utc-start', UTC_START, '-o', str(sigmf_arg),
         '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+    sigmf_base = expected_out_base(sigmf_arg, UTC_START)
     sigmf_size = sigmf_base.with_suffix('.sigmf-data').stat().st_size
 
-    drf_dir = tmp_path / 'sliced_drf'
+    drf_arg = tmp_path / 'sliced_drf'
     run(str(SLICER), str(path), '--fs', str(fs),
-        '--utc-start', '2026-08-18T12:00:00', '-o', str(drf_dir),
+        '--utc-start', UTC_START, '-o', str(drf_arg),
         '--format', 'digitalrf', '--drf-compression-level', '9',
         '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+    drf_dir = expected_out_base(drf_arg, UTC_START)
     drf_size = sum(f.stat().st_size for f in drf_dir.rglob('*') if f.is_file())
 
     assert drf_size < sigmf_size * 1.5  # generous margin; real ratio was ~1.0
+
+
+def test_utc_start_hyphen_format_matches_colon_format(synthetic_signal, tmp_path):
+    """burst_slicer.py --utc-start should accept the hyphen-separated time
+    format used by gr-filerepeater_n6rfm (2026-08-18T12-00-00, filename-
+    safe -- no colons) and produce identical output to the equivalent
+    standard ISO8601 (colon-separated) timestamp -- including an identical
+    output filename suffix, since both should normalize to the same
+    hyphenated form."""
+    path, fs, _ = synthetic_signal
+
+    hyphen_arg = tmp_path / 'sliced_hyphen'
+    hyphen_utc = '2026-08-18T12-00-00'
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', hyphen_utc, '-o', str(hyphen_arg),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+
+    colon_arg = tmp_path / 'sliced_colon'
+    colon_utc = '2026-08-18T12:00:00'
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', colon_utc, '-o', str(colon_arg),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+
+    hyphen_base = expected_out_base(hyphen_arg, hyphen_utc)
+    colon_base = expected_out_base(colon_arg, colon_utc)
+
+    # both should carry the identical timestamp suffix (just different -o prefixes)
+    assert hyphen_base.name.endswith('_2026-08-18T12-00-00_utc')
+    assert colon_base.name.endswith('_2026-08-18T12-00-00_utc')
+
+    hyphen_meta = json.loads(hyphen_base.with_suffix('.sigmf-meta').read_text())
+    colon_meta = json.loads(colon_base.with_suffix('.sigmf-meta').read_text())
+    assert hyphen_meta == colon_meta
+
+
+def test_output_filename_has_utc_suffix(synthetic_signal, tmp_path):
+    """Direct check of the requested behavior: -o sliced --utc-start
+    2026-08-18T12-00-00 should write sliced_2026-08-18T12-00-00_utc.*"""
+    path, fs, _ = synthetic_signal
+    out_arg = tmp_path / 'sliced'
+    utc = '2026-08-18T12-00-00'
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', utc, '-o', str(out_arg),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+
+    expected_meta = tmp_path / 'sliced_2026-08-18T12-00-00_utc.sigmf-meta'
+    expected_data = tmp_path / 'sliced_2026-08-18T12-00-00_utc.sigmf-data'
+    assert expected_meta.exists()
+    assert expected_data.exists()
+
+
+def test_utc_offset_matches_equivalent_utc_start(synthetic_signal, tmp_path):
+    """--utc-offset, reading a local timestamp embedded in a
+    gr-filerepeater_n6rfm-style filename, should produce identical output
+    to specifying the equivalent UTC time directly with --utc-start."""
+    orig_path, fs, _ = synthetic_signal
+
+    # rename to embed a local timestamp the way gr-filerepeater_n6rfm does
+    filename_path = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq'
+    filename_path.write_bytes(orig_path.read_bytes())
+
+    offset_arg = tmp_path / 'sliced_offset'
+    run(str(SLICER), str(filename_path), '--fs', str(fs),
+        '--utc-offset', '-4', '-o', str(offset_arg),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+
+    # 13:30 local, UTC-4 -> 17:30 UTC
+    equiv_utc = '2026-08-18T17-30-00'
+    start_arg = tmp_path / 'sliced_start'
+    run(str(SLICER), str(orig_path), '--fs', str(fs),
+        '--utc-start', equiv_utc, '-o', str(start_arg),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+
+    offset_base = expected_out_base(offset_arg, equiv_utc)
+    start_base = expected_out_base(start_arg, equiv_utc)
+
+    offset_meta = json.loads(offset_base.with_suffix('.sigmf-meta').read_text())
+    start_meta = json.loads(start_base.with_suffix('.sigmf-meta').read_text())
+    assert offset_meta == start_meta
+
+
+def test_utc_offset_without_embedded_timestamp_fails_clearly(synthetic_signal, tmp_path):
+    """--utc-offset on a filename with no embedded timestamp should fail
+    with a clear, actionable error rather than crash or silently guess."""
+    path, fs, _ = synthetic_signal
+    result = subprocess.run(
+        [sys.executable, str(SLICER), str(path), '--fs', str(fs),
+         '--utc-offset', '-4', '-o', str(tmp_path / 'sliced')],
+        capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'no embedded timestamp' in result.stderr
+    assert '--utc-start' in result.stderr

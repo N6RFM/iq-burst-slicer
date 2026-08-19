@@ -92,34 +92,60 @@ system HDF5 headers needed, at least on Linux x86_64.)
 Want to try the tools immediately without your own data? The repo ships a
 small example file — see [`examples/`](examples/).
 
+`--utc-start` accepts the hyphen-separated, filename-safe time format used
+by `gr-filerepeater_n6rfm` (`2026-08-18T17-48-10` — no colons), and also
+still accepts standard ISO8601 with colons (`2026-08-18T17:48:10`) for
+backward compatibility. Either way, the UTC start time is automatically
+appended to the output filename as `_{timestamp}_utc` (normalized to the
+hyphenated form), so `-o my_capture_sliced` with `--utc-start
+2026-08-18T17-48-10` writes `my_capture_sliced_2026-08-18T17-48-10_utc.*`
+rather than plain `my_capture_sliced.*` — the timestamp is always visible
+in the filename itself, not just inside the metadata.
+
+**If your input filename already carries a local timestamp** (the
+`gr-filerepeater_n6rfm` convention, e.g.
+`DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq`), use
+`--utc-offset` instead of `--utc-start` — give the UTC offset in hours
+(e.g. `-4` for Rhode Island EDT) and the tool reads the embedded local
+time from the filename and converts it for you:
+
+```bash
+python3 burst_slicer.py DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq \
+    --fs 50000 --utc-offset -4 -o sliced_output
+#   13:30 local (embedded in filename) - (-4h) = 17:30 UTC
+#   -> sliced_output_2026-08-18T17-30-00_utc.sigmf-data / .sigmf-meta
+```
+
+`--utc-start` and `--utc-offset` are mutually exclusive — give exactly one.
+
 ```bash
 # Slice bursts out of a large recording (SigMF, the default)
 python3 burst_slicer.py my_capture.iq --fs 50000 \
-    --utc-start 2026-08-18T17:48:10 \
+    --utc-start 2026-08-18T17-48-10 \
     -o my_capture_sliced
 
-#   -> my_capture_sliced.sigmf-data   (raw samples, bursts only)
-#   -> my_capture_sliced.sigmf-meta   (JSON, one timestamped entry per burst)
+#   -> my_capture_sliced_2026-08-18T17-48-10_utc.sigmf-data   (raw samples, bursts only)
+#   -> my_capture_sliced_2026-08-18T17-48-10_utc.sigmf-meta   (JSON, one timestamped entry per burst)
 
 # ...or Digital RF instead:
 python3 burst_slicer.py my_capture.iq --fs 50000 \
-    --utc-start 2026-08-18T17:48:10 \
+    --utc-start 2026-08-18T17-48-10 \
     -o my_capture_sliced_drf --format digitalrf
 
-#   -> my_capture_sliced_drf/ch0/*.h5          (HDF5 data, gaps native to the format)
-#   -> my_capture_sliced_drf/burstslicer_info.json  (JSON sidecar)
+#   -> my_capture_sliced_drf_2026-08-18T17-48-10_utc/ch0/*.h5          (HDF5 data, gaps native to the format)
+#   -> my_capture_sliced_drf_2026-08-18T17-48-10_utc/burstslicer_info.json  (JSON sidecar)
 
 # Reconstruct a plain IQ file if you need one, with the ORIGINAL timeline
 # exactly restored (verified byte-identical burst content, exact original
 # file length):
-python3 sigmf_to_iq.py my_capture_sliced.sigmf-meta \
+python3 sigmf_to_iq.py my_capture_sliced_2026-08-18T17-48-10_utc.sigmf-meta \
     -o my_capture_restored.iq --full-timeline --noise-fill
 # or, from Digital RF:
-python3 digitalrf_to_iq.py my_capture_sliced_drf \
+python3 digitalrf_to_iq.py my_capture_sliced_drf_2026-08-18T17-48-10_utc \
     -o my_capture_restored.iq --full-timeline --noise-fill
 
 # Or just the bursts concatenated with no gaps (smallest possible plain IQ):
-python3 sigmf_to_iq.py my_capture_sliced.sigmf-meta \
+python3 sigmf_to_iq.py my_capture_sliced_2026-08-18T17-48-10_utc.sigmf-meta \
     -o my_capture_compact.iq --compact
 ```
 
@@ -140,7 +166,7 @@ python3 sigmf_to_iq.py my_capture_sliced.sigmf-meta \
 
 ```bash
 python3 burst_slicer.py other_signal.iq --fs 200000 \
-    --utc-start 2026-08-18T12:00:00 -o sliced \
+    --utc-start 2026-08-18T12-00-00 -o sliced \
     --thresh-factor 1.5 --block-s 0.01 --min-gap-s 0.5
 ```
 

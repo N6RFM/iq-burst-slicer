@@ -52,9 +52,15 @@ fraction-of-a-second burst once a minute, expect 50-150x versus the original
 file, before even considering which output format to use.
 
 Usage:
-    python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17:48:10 -o sliced_output
-    python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17:48:10 -o sliced_output --thresh-factor 1.5
-    python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17:48:10 -o sliced_drf --format digitalrf
+    python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17-48-10 -o sliced_output
+    python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17-48-10 -o sliced_output --thresh-factor 1.5
+    python3 burst_slicer.py INPUT.iq --fs 50000 --utc-start 2026-08-18T17-48-10 -o sliced_drf --format digitalrf
+
+    # Or, if the input filename already carries a local timestamp in the
+    # gr-filerepeater_n6rfm convention (YYYY_MM_DD_THH-MM-SS), skip
+    # --utc-start and just give the UTC offset instead:
+    python3 burst_slicer.py DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq \
+        --fs 50000 --utc-offset -4 -o sliced_output
 
 Tuning for your signal:
     --thresh-factor   how far above the noise floor (median envelope) a
@@ -78,9 +84,50 @@ Requires: numpy (plus digital_rf, only if using --format digitalrf)
 import argparse
 import datetime as dt
 import json
+import re
 from pathlib import Path
 
 import numpy as np
+
+
+def parse_utc_arg(s):
+    """Parse a UTC timestamp argument. Accepts the hyphen-separated time
+    format used by gr-filerepeater_n6rfm (2026-08-18T17-48-10, filename-
+    safe -- no colons) as well as standard ISO8601 (2026-08-18T17:48:10),
+    so existing scripts/muscle memory using either format keep working."""
+    if 'T' in s:
+        date_part, time_part = s.split('T', 1)
+        time_part = time_part.replace('-', ':')
+        s = f'{date_part}T{time_part}'
+    t = dt.datetime.fromisoformat(s)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t
+
+
+_FILENAME_TIMESTAMP_RE = re.compile(
+    r'(\d{4})_(\d{2})_(\d{2})_T(\d{2})-(\d{2})-(\d{2})')
+
+
+def parse_local_start_from_filename(path, utc_offset_hours):
+    """Extract the LOCAL recording-start timestamp embedded in a
+    gr-filerepeater_n6rfm-style input filename (e.g.
+    DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq embeds
+    2026-08-18 13:30:00 local) and convert it to UTC using the given
+    offset in hours (e.g. -4 for Rhode Island EDT, so that
+    UTC = local - utc_offset_hours). Raises SystemExit with a clear
+    message if the filename doesn't contain a recognizable timestamp."""
+    m = _FILENAME_TIMESTAMP_RE.search(Path(path).name)
+    if not m:
+        raise SystemExit(
+            f"Error: --utc-offset was given, but no embedded timestamp of the form "
+            f"YYYY_MM_DD_THH-MM-SS (gr-filerepeater_n6rfm convention) was found in the "
+            f"input filename '{Path(path).name}'. Use --utc-start instead to specify the "
+            f"UTC start time directly.")
+    year, month, day, hour, minute, second = (int(x) for x in m.groups())
+    local_dt = dt.datetime(year, month, day, hour, minute, second)
+    utc_dt = local_dt - dt.timedelta(hours=utc_offset_hours)
+    return utc_dt.replace(tzinfo=dt.timezone.utc)
 
 
 def find_bursts(iq, fs, block_s=0.05, thresh_factor=1.8, min_gap_s=1.0):
@@ -227,9 +274,20 @@ def main():
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('input', help='Path to raw complex-float32 IQ file')
     ap.add_argument('--fs', type=float, required=True, help='Sample rate in Hz')
-    ap.add_argument('--utc-start', required=True,
-                     help='ISO8601 UTC timestamp of sample 0 in the INPUT file, '
-                          'e.g. 2026-08-18T17:48:10')
+    utc_group = ap.add_mutually_exclusive_group(required=True)
+    utc_group.add_argument('--utc-start',
+                     help='UTC timestamp of sample 0 in the INPUT file, in the hyphen-separated '
+                          'format used by gr-filerepeater_n6rfm, e.g. 2026-08-18T17-48-10 '
+                          '(standard ISO8601 with colons, e.g. 2026-08-18T17:48:10, is also '
+                          'still accepted)')
+    utc_group.add_argument('--utc-offset', type=float,
+                     help='Alternative to --utc-start: instead of specifying UTC directly, '
+                          'read the LOCAL recording-start timestamp already embedded in the '
+                          'gr-filerepeater_n6rfm-style input filename (e.g. '
+                          'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq '
+                          'embeds 2026-08-18 13:30:00 local) and convert it to UTC using this '
+                          'offset in hours, e.g. -4 for Rhode Island EDT '
+                          '(UTC = local time - offset).')
     ap.add_argument('-o', '--output', required=True,
                      help='Output basename/directory (without extension) -- for '
                           '--format sigmf writes OUTPUT.sigmf-data/.sigmf-meta; '
@@ -261,9 +319,13 @@ def main():
     args = ap.parse_args()
 
     fs = args.fs
-    t_start = dt.datetime.fromisoformat(args.utc_start)
-    if t_start.tzinfo is None:
-        t_start = t_start.replace(tzinfo=dt.timezone.utc)
+    if args.utc_start is not None:
+        t_start = parse_utc_arg(args.utc_start)
+    else:
+        t_start = parse_local_start_from_filename(args.input, args.utc_offset)
+        local_preview = t_start + dt.timedelta(hours=args.utc_offset)
+        print(f'Parsed local start time from filename: {local_preview.strftime("%Y-%m-%d %H:%M:%S")} '
+              f'(offset {args.utc_offset:+.1f}h) -> UTC {t_start.strftime("%Y-%m-%dT%H:%M:%S")}Z')
 
     in_path = Path(args.input)
     raw = np.fromfile(in_path, dtype=np.float32)
@@ -285,7 +347,13 @@ def main():
         slices.append((lo, hi))
 
     in_size = in_path.stat().st_size
-    out_base = Path(args.output)
+    # Append the UTC start time to the output basename, in the same
+    # hyphen-separated, filename-safe format used by gr-filerepeater_n6rfm,
+    # regardless of which format --utc-start was given in -- e.g.
+    # -o sliced --utc-start 2026-08-18T12-00-00 writes
+    # sliced_2026-08-18T12-00-00_utc.sigmf-data / .sigmf-meta
+    utc_suffix = t_start.strftime('%Y-%m-%dT%H-%M-%S')
+    out_base = Path(f'{args.output}_{utc_suffix}_utc')
 
     if args.format == 'sigmf':
         out_size = write_sigmf(iq, fs, t_start, slices, out_base, args.author, args.description)

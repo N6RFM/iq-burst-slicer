@@ -21,17 +21,19 @@ cd examples
 
 # Slice it
 python3 ../burst_slicer.py example_signal.iq --fs 50000 \
-    --utc-start 2026-01-01T00:00:00 -o example_sliced \
+    --utc-start 2026-01-01T00-00-00 -o example_sliced \
     --thresh-factor 1.5 --block-s 0.01 --min-gap-s 0.5
 
 # Expect: 4 burst regions detected (the 7.50s/7.55s pair merges into one,
 # since they're closer together than --min-gap-s 0.5), ~35-40x smaller.
+# Output is written to example_sliced_2026-01-01T00-00-00_utc.sigmf-{data,meta}
+# -- the UTC start time is always appended to the output filename.
 
 # Look at the timestamps
-cat example_sliced.sigmf-meta
+cat example_sliced_2026-01-01T00-00-00_utc.sigmf-meta
 
 # Reconstruct it and verify you get the original back
-python3 ../sigmf_to_iq.py example_sliced.sigmf-meta \
+python3 ../sigmf_to_iq.py example_sliced_2026-01-01T00-00-00_utc.sigmf-meta \
     -o example_restored.iq --full-timeline --noise-fill
 ```
 
