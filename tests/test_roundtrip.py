@@ -79,8 +79,8 @@ def synthetic_signal(tmp_path):
     return path, fs, sig
 
 
-def run(*args):
-    result = subprocess.run([sys.executable, *args], capture_output=True, text=True)
+def run(*args, cwd=None):
+    result = subprocess.run([sys.executable, *args], capture_output=True, text=True, cwd=cwd)
     assert result.returncode == 0, f'command failed:\n{result.stdout}\n{result.stderr}'
     return result.stdout
 
@@ -324,3 +324,147 @@ def test_utc_offset_without_embedded_timestamp_fails_clearly(synthetic_signal, t
     assert result.returncode != 0
     assert 'no embedded timestamp' in result.stderr
     assert '--utc-start' in result.stderr
+
+
+def test_no_output_arg_reuses_input_filename_replacing_embedded_timestamp(synthetic_signal, tmp_path):
+    """With no -o given and an input filename that already embeds a
+    gr-filerepeater_n6rfm-style local timestamp, the output filename should
+    reuse the input name with that timestamp REPLACED by the corrected UTC
+    time (not a second, redundant timestamp appended)."""
+    orig_path, fs, _ = synthetic_signal
+    filename_path = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq'
+    filename_path.write_bytes(orig_path.read_bytes())
+
+    run(str(SLICER), str(filename_path), '--fs', str(fs),
+        '--utc-offset', '-4',
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5',
+        cwd=tmp_path)
+
+    expected = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T17-30-00_utc.sigmf-meta'
+    assert expected.exists()
+    # the OLD (local) timestamp must not appear in any OUTPUT filename
+    # (the input .iq file itself legitimately still has it -- that's fine)
+    outputs_with_old_ts = [p for p in tmp_path.glob('*T13-30-00*') if p.suffix != '.iq']
+    assert not outputs_with_old_ts
+
+
+def test_no_output_arg_falls_back_to_appended_suffix(synthetic_signal, tmp_path):
+    """With no -o given and an input filename with NO embedded timestamp,
+    fall back to appending the usual _{utc}_utc suffix to the input stem."""
+    path, fs, _ = synthetic_signal  # fixture writes to 'synthetic.iq', no embedded timestamp
+
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', '2026-08-18T17-48-10',
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5',
+        cwd=tmp_path)
+
+    expected = tmp_path / 'synthetic_2026-08-18T17-48-10_utc.sigmf-meta'
+    assert expected.exists()
+
+
+def test_format_defaults_to_sigmf_without_flag(synthetic_signal, tmp_path):
+    """--format should not be required; omitting it should behave exactly
+    like --format sigmf."""
+    path, fs, _ = synthetic_signal
+    out_arg = tmp_path / 'sliced'
+    run(str(SLICER), str(path), '--fs', str(fs),
+        '--utc-start', UTC_START, '-o', str(out_arg),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+    out_base = expected_out_base(out_arg, UTC_START)
+    assert out_base.with_suffix('.sigmf-data').exists()
+    assert out_base.with_suffix('.sigmf-meta').exists()
+
+
+def test_no_time_arg_reuses_embedded_timestamp_without_utc_claim(synthetic_signal, tmp_path):
+    """With neither --utc-start nor --utc-offset given, and an input
+    filename embedding a gr-filerepeater_n6rfm-style timestamp, that
+    timestamp should be reused EXACTLY as-is, with NO timezone/UTC
+    assumption -- the output filename should be identical to the input
+    filename's stem (no '_utc' marker, no substitution), since nothing
+    was actually verified or converted."""
+    orig_path, fs, _ = synthetic_signal
+    filename_path = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T17-30-00.iq'
+    filename_path.write_bytes(orig_path.read_bytes())
+
+    run(str(SLICER), str(filename_path), '--fs', str(fs),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5',
+        cwd=tmp_path)
+
+    # output name == input stem, completely unchanged, no '_utc' appended
+    expected = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T17-30-00.sigmf-meta'
+    assert expected.exists()
+    assert not list(tmp_path.glob('*_utc*'))
+
+
+def test_no_time_arg_without_embedded_timestamp_fails_clearly(synthetic_signal, tmp_path):
+    """With neither --utc-start, --utc-offset, nor a filename-embedded
+    timestamp, fail with a clear, actionable error rather than crash."""
+    path, fs, _ = synthetic_signal
+    result = subprocess.run(
+        [sys.executable, str(SLICER), str(path), '--fs', str(fs)],
+        capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'no embedded timestamp' in result.stderr
+    assert '--utc-start' in result.stderr and '--utc-offset' in result.stderr
+
+
+def test_no_time_arg_with_explicit_output_uses_it_unmodified(synthetic_signal, tmp_path):
+    """With neither --utc-start nor --utc-offset given, but -o given
+    explicitly, the given name should be used exactly as-is, with no
+    '_utc'-claiming timestamp appended (nothing was verified as UTC)."""
+    orig_path, fs, _ = synthetic_signal
+    filename_path = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq'
+    filename_path.write_bytes(orig_path.read_bytes())
+
+    run(str(SLICER), str(filename_path), '--fs', str(fs), '-o', str(tmp_path / 'manual_name'),
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5')
+
+    assert (tmp_path / 'manual_name.sigmf-meta').exists()
+    assert (tmp_path / 'manual_name.sigmf-data').exists()
+    assert not list(tmp_path.glob('manual_name*_utc*'))
+
+
+def test_utc_start_and_utc_offset_still_mutually_exclusive(synthetic_signal, tmp_path):
+    """Both being optional now shouldn't loosen the still-required
+    mutual exclusivity between the two when both ARE given."""
+    path, fs, _ = synthetic_signal
+    result = subprocess.run(
+        [sys.executable, str(SLICER), str(path), '--fs', str(fs),
+         '--utc-start', '2026-08-18T12-00-00', '--utc-offset', '-4',
+         '-o', str(tmp_path / 'sliced')],
+        capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'not allowed with argument' in result.stderr
+
+
+def test_utc_offset_still_appends_utc_suffix(synthetic_signal, tmp_path):
+    """Sanity check that fixing the 'neither given' case didn't disturb
+    the (still correct, still verified) --utc-offset behavior."""
+    orig_path, fs, _ = synthetic_signal
+    filename_path = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq'
+    filename_path.write_bytes(orig_path.read_bytes())
+
+    run(str(SLICER), str(filename_path), '--fs', str(fs), '--utc-offset', '-4',
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5',
+        cwd=tmp_path)
+
+    expected = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T17-30-00_utc.sigmf-meta'
+    assert expected.exists()
+
+
+def test_default_output_no_doubled_utc_suffix(synthetic_signal, tmp_path):
+    """Feeding back a filename that already ends in '_utc' (e.g. this
+    tool's own previous output, or a manually-named file), WITH
+    --utc-offset given, should not produce a doubled '_utc_utc' in the
+    output name."""
+    orig_path, fs, _ = synthetic_signal
+    filename_path = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00_utc.iq'
+    filename_path.write_bytes(orig_path.read_bytes())
+
+    run(str(SLICER), str(filename_path), '--fs', str(fs), '--utc-offset', '-4',
+        '--thresh-factor', '1.5', '--block-s', '0.01', '--min-gap-s', '0.5',
+        cwd=tmp_path)
+
+    expected = tmp_path / 'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T17-30-00_utc.sigmf-meta'
+    assert expected.exists()
+    assert not list(tmp_path.glob('*_utc_utc*'))

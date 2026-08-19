@@ -109,25 +109,66 @@ _FILENAME_TIMESTAMP_RE = re.compile(
     r'(\d{4})_(\d{2})_(\d{2})_T(\d{2})-(\d{2})-(\d{2})')
 
 
-def parse_local_start_from_filename(path, utc_offset_hours):
+def parse_local_start_from_filename(path, utc_offset_hours, context='--utc-offset was given'):
     """Extract the LOCAL recording-start timestamp embedded in a
     gr-filerepeater_n6rfm-style input filename (e.g.
     DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq embeds
     2026-08-18 13:30:00 local) and convert it to UTC using the given
     offset in hours (e.g. -4 for Rhode Island EDT, so that
-    UTC = local - utc_offset_hours). Raises SystemExit with a clear
-    message if the filename doesn't contain a recognizable timestamp."""
+    UTC = local - utc_offset_hours; pass 0 to use the embedded timestamp
+    directly as UTC with no conversion). Raises SystemExit with a clear
+    message if the filename doesn't contain a recognizable timestamp;
+    `context` customizes that message's opening clause for where this was
+    called from."""
     m = _FILENAME_TIMESTAMP_RE.search(Path(path).name)
     if not m:
         raise SystemExit(
-            f"Error: --utc-offset was given, but no embedded timestamp of the form "
+            f"Error: {context}, but no embedded timestamp of the form "
             f"YYYY_MM_DD_THH-MM-SS (gr-filerepeater_n6rfm convention) was found in the "
-            f"input filename '{Path(path).name}'. Use --utc-start instead to specify the "
-            f"UTC start time directly.")
+            f"input filename '{Path(path).name}'. Use --utc-start or --utc-offset to "
+            f"specify the UTC start time directly.")
     year, month, day, hour, minute, second = (int(x) for x in m.groups())
     local_dt = dt.datetime(year, month, day, hour, minute, second)
     utc_dt = local_dt - dt.timedelta(hours=utc_offset_hours)
     return utc_dt.replace(tzinfo=dt.timezone.utc)
+
+
+def default_output_base(input_path, t_start):
+    """When -o is not given AND the UTC start time was actually verified
+    (via --utc-start or --utc-offset -- see time_verified_utc in main()),
+    derive an output basename from the input filename instead of
+    requiring one.
+
+    If the input filename already contains an embedded gr-filerepeater_n6rfm
+    -style timestamp (YYYY_MM_DD_THH-MM-SS -- the same pattern --utc-offset
+    reads), that timestamp is REPLACED with the corrected UTC time in the
+    same style, rather than appending a second, redundant timestamp. E.g.
+    DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq (local)
+    with --utc-offset -4 becomes output base
+    DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T17-30-00_utc
+
+    If no embedded timestamp is found (e.g. an arbitrary input filename
+    used with --utc-start), the usual _{timestamp}_utc suffix is appended
+    to the input filename's stem instead, same as when -o is given
+    explicitly.
+
+    Either way, if the resulting name already ends with '_utc' (e.g. the
+    input itself was already a previous run's output, fed back in), an
+    extra '_utc' is NOT appended on top -- avoids a doubled
+    '..._utc_utc.sigmf-data'.
+
+    This function is only called when time_verified_utc is True. When it's
+    False (neither --utc-start nor --utc-offset given), the caller reuses
+    the input filename completely unchanged instead -- see main()."""
+    stem = Path(input_path).stem
+    if _FILENAME_TIMESTAMP_RE.search(stem):
+        utc_token = t_start.strftime('%Y_%m_%d_T%H-%M-%S')
+        new_stem = _FILENAME_TIMESTAMP_RE.sub(utc_token, stem)
+        return new_stem if new_stem.endswith('_utc') else f'{new_stem}_utc'
+    utc_suffix = t_start.strftime('%Y-%m-%dT%H-%M-%S')
+    if stem.endswith('_utc'):
+        stem = stem[:-len('_utc')]
+    return f'{stem}_{utc_suffix}_utc'
 
 
 def find_bursts(iq, fs, block_s=0.05, thresh_factor=1.8, min_gap_s=1.0):
@@ -274,7 +315,7 @@ def main():
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('input', help='Path to raw complex-float32 IQ file')
     ap.add_argument('--fs', type=float, required=True, help='Sample rate in Hz')
-    utc_group = ap.add_mutually_exclusive_group(required=True)
+    utc_group = ap.add_mutually_exclusive_group(required=False)
     utc_group.add_argument('--utc-start',
                      help='UTC timestamp of sample 0 in the INPUT file, in the hyphen-separated '
                           'format used by gr-filerepeater_n6rfm, e.g. 2026-08-18T17-48-10 '
@@ -287,11 +328,17 @@ def main():
                           'DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq '
                           'embeds 2026-08-18 13:30:00 local) and convert it to UTC using this '
                           'offset in hours, e.g. -4 for Rhode Island EDT '
-                          '(UTC = local time - offset).')
-    ap.add_argument('-o', '--output', required=True,
+                          '(UTC = local time - offset). If NEITHER --utc-start nor '
+                          '--utc-offset is given, the embedded timestamp (if any) in the '
+                          'input filename is used directly as UTC (equivalent to '
+                          '--utc-offset 0) -- for input already named with a UTC timestamp.')
+    ap.add_argument('-o', '--output', default=None,
                      help='Output basename/directory (without extension) -- for '
                           '--format sigmf writes OUTPUT.sigmf-data/.sigmf-meta; '
-                          'for --format digitalrf writes an OUTPUT/ directory')
+                          'for --format digitalrf writes an OUTPUT/ directory. '
+                          'If omitted, the input filename is reused (see '
+                          'default_output_base() docstring for exactly how the '
+                          'timestamp is handled).')
     ap.add_argument('--format', choices=['sigmf', 'digitalrf'], default='sigmf',
                      help="Output format (default 'sigmf'). See this script's "
                           "module docstring for a real size comparison between "
@@ -319,13 +366,31 @@ def main():
     args = ap.parse_args()
 
     fs = args.fs
+    time_verified_utc = True
     if args.utc_start is not None:
         t_start = parse_utc_arg(args.utc_start)
-    else:
+    elif args.utc_offset is not None:
         t_start = parse_local_start_from_filename(args.input, args.utc_offset)
         local_preview = t_start + dt.timedelta(hours=args.utc_offset)
         print(f'Parsed local start time from filename: {local_preview.strftime("%Y-%m-%d %H:%M:%S")} '
               f'(offset {args.utc_offset:+.1f}h) -> UTC {t_start.strftime("%Y-%m-%dT%H:%M:%S")}Z')
+    else:
+        # Neither given: reuse the embedded filename timestamp exactly as
+        # written, with NO assumption about its timezone/UTC-ness -- we
+        # were not told it's UTC, so we don't claim it is. Internally we
+        # still need a tz-aware datetime for burst-offset arithmetic and
+        # to populate the (nominally-UTC) SigMF datetime fields, so we tag
+        # it UTC for computation purposes only -- but time_verified_utc
+        # stays False, which suppresses the '_utc' marker and any output-
+        # filename timestamp substitution below, since we have not
+        # actually verified or converted anything.
+        t_start = parse_local_start_from_filename(
+            args.input, 0.0, context='Neither --utc-start nor --utc-offset was given')
+        time_verified_utc = False
+        print(f'No --utc-start/--utc-offset given; reusing embedded filename timestamp '
+              f'as-is ({t_start.strftime("%Y-%m-%dT%H:%M:%S")}) -- NOT assumed to be UTC, '
+              f'just passed through unchanged. Output filename will not claim a "_utc" '
+              f'timestamp since none was verified.')
 
     in_path = Path(args.input)
     raw = np.fromfile(in_path, dtype=np.float32)
@@ -347,13 +412,33 @@ def main():
         slices.append((lo, hi))
 
     in_size = in_path.stat().st_size
-    # Append the UTC start time to the output basename, in the same
-    # hyphen-separated, filename-safe format used by gr-filerepeater_n6rfm,
-    # regardless of which format --utc-start was given in -- e.g.
-    # -o sliced --utc-start 2026-08-18T12-00-00 writes
-    # sliced_2026-08-18T12-00-00_utc.sigmf-data / .sigmf-meta
-    utc_suffix = t_start.strftime('%Y-%m-%dT%H-%M-%S')
-    out_base = Path(f'{args.output}_{utc_suffix}_utc')
+    if args.output is not None:
+        if time_verified_utc:
+            # Append the UTC start time to the given output basename, in the
+            # same hyphen-separated, filename-safe format used by
+            # gr-filerepeater_n6rfm -- e.g. -o sliced --utc-start
+            # 2026-08-18T12-00-00 writes sliced_2026-08-18T12-00-00_utc.*
+            utc_suffix = t_start.strftime('%Y-%m-%dT%H-%M-%S')
+            out_base = Path(f'{args.output}_{utc_suffix}_utc')
+        else:
+            # Time was NOT verified as UTC (neither --utc-start nor
+            # --utc-offset given) -- use the given -o exactly as given,
+            # with no '_utc'-claiming timestamp appended, since we have no
+            # verified UTC value to append.
+            out_base = Path(args.output)
+    else:
+        if time_verified_utc:
+            # No -o given: reuse the input filename (see
+            # default_output_base() docstring for exactly how an
+            # already-embedded timestamp is handled)
+            out_base = Path(default_output_base(args.input, t_start))
+        else:
+            # No -o given AND time not verified: reuse the input filename
+            # completely unchanged (just the stem -- the extension/suffix
+            # still comes from --format below). Nothing was converted or
+            # confirmed, so nothing about the name should change either.
+            out_base = Path(Path(args.input).stem)
+        print(f'No -o given; writing output as: {out_base}')
 
     if args.format == 'sigmf':
         out_size = write_sigmf(iq, fs, t_start, slices, out_base, args.author, args.description)

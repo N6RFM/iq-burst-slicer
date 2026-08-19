@@ -116,7 +116,53 @@ python3 burst_slicer.py DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-0
 #   -> sliced_output_2026-08-18T17-30-00_utc.sigmf-data / .sigmf-meta
 ```
 
-`--utc-start` and `--utc-offset` are mutually exclusive — give exactly one.
+`--utc-start` and `--utc-offset` are mutually exclusive if both are given —
+but **both are optional**. If neither is given, the timestamp already
+embedded in the input filename is reused **exactly as written, with no
+timezone assumption** — it is *not* treated as UTC, just passed through
+unchanged, since we weren't told what timezone it's actually in:
+
+```bash
+python3 burst_slicer.py DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq --fs 50000
+#   T13-30-00 is reused exactly as-is -- no UTC claim, no conversion,
+#   -> DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.sigmf-data / .sigmf-meta
+#      (same filename, just the .sigmf-data/.sigmf-meta suffix added -- no "_utc" marker,
+#       since nothing was actually verified as UTC)
+```
+
+If the input filename has no recognizable embedded timestamp and neither
+`--utc-start` nor `--utc-offset` was given, the tool fails with a clear
+error rather than guessing.
+
+**`-o`/`--output` is optional.** If omitted, the input filename is reused
+automatically:
+
+- **If the UTC time was verified** (`--utc-start` or `--utc-offset` was
+  given) and the input filename already embeds a `gr-filerepeater_n6rfm`
+  -style timestamp, that timestamp is **replaced** with the corrected UTC
+  time (not appended a second time) — so
+  `DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq` with
+  `--utc-offset -4` and no `-o` writes
+  `DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T17-30-00_utc.sigmf-data`
+  / `.sigmf-meta` — same filename, local time swapped for UTC, and a
+  `_utc` marker added since that conversion was actually verified.
+- **If the UTC time was verified** but there's no embedded timestamp to
+  replace, the usual `_{timestamp}_utc` suffix is appended to the input
+  filename's stem instead, same as when `-o` is given explicitly.
+- **If the UTC time was *not* verified** (neither flag given), the input
+  filename's stem is reused **completely unchanged** — no substitution,
+  no `_utc` suffix, since nothing was actually confirmed as UTC. This
+  applies whether or not `-o` was given: an explicit `-o` name is also
+  used exactly as given, with no `_utc`-claiming timestamp appended.
+
+`--format` is also optional and defaults to `sigmf`, so the shortest
+possible invocation — input filename already has a usable timestamp, no
+`-o`, no `--format` — is just:
+
+```bash
+python3 burst_slicer.py DSTARONESPARROW_50000SPS_435700000Hz_2026_08_18_T13-30-00.iq \
+    --fs 50000 --utc-offset -4
+```
 
 ```bash
 # Slice bursts out of a large recording (SigMF, the default)
